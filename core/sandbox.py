@@ -6,6 +6,45 @@ import re
 import platform
 import shutil
 
+
+def force_host_binding(content: str, port: int = 5000) -> str:
+    """Rewrite a web server's bind so it listens on 0.0.0.0:<port>.
+
+    Used by the sandbox (always port 5000) and by /server, which assigns each
+    app its own free port — generated apps hardcode 0.0.0.0:5000, so the port
+    rewrite is what lets two or three apps run side by side without collisions.
+    """
+    # Flask: app.run(...) → app.run(host="0.0.0.0", port=<port>)
+    if "Flask" in content and re.search(r"\.run\(", content):
+        content = re.sub(
+            r"\.run\([^)]*\)",
+            f'.run(host="0.0.0.0", port={port})',
+            content,
+            count=1,
+        )
+
+    # FastAPI: uvicorn.run(app, ...) → uvicorn.run(app, host="0.0.0.0", port=<port>)
+    m = re.search(r"uvicorn\.run\(\s*([^,)]+)", content)
+    if m:
+        first_arg = m.group(1).strip()
+        content = re.sub(
+            r"uvicorn\.run\([^)]*\)",
+            f'uvicorn.run({first_arg}, host="0.0.0.0", port={port})',
+            content,
+            count=1,
+        )
+
+    # Express/Node: .listen(5000[, "host"]) → .listen(<port>, "0.0.0.0")
+    content = re.sub(
+        r"\.listen\(\s*\d+\s*(?:,\s*['\"][^'\"]*['\"])?",
+        f'.listen({port}, "0.0.0.0"',
+        content,
+        count=1,
+    )
+
+    return content
+
+
 class Sandbox:
     def __init__(self, workspace_dir: str = "workspace"):
         self.workspace_dir = Path(workspace_dir)
@@ -21,31 +60,7 @@ class Sandbox:
         return content
 
     def _force_host_binding(self, content: str) -> str:
-        """Make generated web servers bind 0.0.0.0:5000 so they're reachable from the host.
-
-        Safety net on top of the Spider-Man prompt instruction. Only rewrites when a
-        0.0.0.0 binding isn't already present, to avoid clobbering correct code.
-        """
-        if "0.0.0.0" in content:
-            return content
-
-        # Flask: app.run(...) → app.run(host="0.0.0.0", port=5000)
-        content = re.sub(
-            r"\.run\([^)]*\)",
-            '.run(host="0.0.0.0", port=5000)',
-            content,
-            count=1,
-        ) if re.search(r"\.run\(", content) and "Flask" in content else content
-
-        # Express: app.listen(5000[, ...]) → app.listen(5000, "0.0.0.0"[, ...])
-        content = re.sub(
-            r"\.listen\(\s*(\d+)",
-            r'.listen(\1, "0.0.0.0"',
-            content,
-            count=1,
-        )
-
-        return content
+        return force_host_binding(content, port=5000)
 
     def write_files(self, files: dict) -> None:
         """Writes ALL files to the workspace."""

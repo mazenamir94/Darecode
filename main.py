@@ -15,7 +15,12 @@ from ui.animations import AnimationEngine
 from memory.session import SessionManager
 from ui.ascii_art import DAREDEVIL_MASK
 from ui import command_handlers as ch
+from core import harnesses
 from core.harnesses import harness
+from core.settings import Settings, apply_settings
+from core.server_manager import ServerManager
+from core.project_manager import ProjectManager
+from pathlib import Path
 
 def print_response(console, text, color="red"):
     """Print response with syntax-highlighted code blocks."""
@@ -36,6 +41,18 @@ def main():
     console = Console()
     current_persona = DAREDEVIL
     current_color = "#CC0000"
+
+    # Persistent settings (~/.darecode/config.json) — model/region/harness/team
+    # survive restarts. The API key stays in .env and is never persisted here.
+    settings = Settings()
+    apply_settings(agent.brain, settings)
+    harnesses.init(
+        enabled=settings.get("harness_enabled", True),
+        summary=settings.get("harness_summary", True),
+    )
+
+    server_manager = ServerManager()
+    project_manager = ProjectManager(Path("workspace"))
 
     ch.print_header(console)
 
@@ -125,15 +142,34 @@ def main():
 
         # NOTE: must precede /mode — "/model".startswith("/mode") is True.
         if user_input.startswith("/model"):
-            ch.cmd_model(console, agent, user_input[len("/model"):])
+            new_model = ch.cmd_model(console, agent, user_input[len("/model"):])
+            if new_model:
+                settings.set("model", new_model)
             continue
 
         if user_input.startswith("/change"):
-            ch.cmd_change_api(console, agent)
+            changed = ch.cmd_change_api(console, agent)
+            if changed:
+                settings.set("model", changed["model"], save=False)
+                settings.set("region", changed["region"])
             continue
 
         if user_input.startswith("/harness"):
-            ch.cmd_harness(console, user_input[len("/harness"):])
+            ch.cmd_harness(console, user_input[len("/harness"):], settings)
+            continue
+
+        if user_input.startswith("/server"):
+            ch.cmd_server(console, server_manager, project_manager,
+                          user_input[len("/server"):])
+            continue
+
+        if user_input.startswith("/project"):
+            ch.cmd_project(console, agent, project_manager,
+                           user_input[len("/project"):])
+            continue
+
+        if user_input.startswith("/team"):
+            ch.cmd_team(console, settings, user_input[len("/team"):])
             continue
 
         if user_input.startswith("/mode"):
@@ -223,6 +259,11 @@ def main():
             continue
 
         active_anim_engine = anim_engine if current_persona.mode == "dark" else None
+
+        # /team on: route plain requests through the Defenders flow below.
+        if settings.get("defenders_auto", False) and not user_input.startswith("/"):
+            console.print("[dim]Team auto-mode: assembling the Defenders…[/dim]")
+            user_input = "/defenders " + user_input
 
         if user_input.startswith("/defenders"):
             prompt = user_input[len("/defenders"):].strip()

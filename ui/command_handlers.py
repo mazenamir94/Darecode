@@ -8,6 +8,9 @@ so prompting with input()/Prompt is safe here.
 
 import os
 import json
+import time
+import shutil
+import tempfile
 from pathlib import Path
 
 from rich.panel import Panel
@@ -18,6 +21,10 @@ from rich.prompt import Prompt
 
 from ui.ascii_art import DAREDEVIL_MASK
 from core.harnesses import harness, summarize_run
+from core.project_manager import (
+    WEB_TYPES, detect_project_type, find_entry_file, get_dev_command,
+)
+from core.sandbox import force_host_binding
 
 SNIPPETS_DIR = Path(__file__).resolve().parent.parent / "snippets"
 
@@ -118,12 +125,26 @@ def cmd_test(console, agent):
         console.print("[dim]No recent code to test. Generate some code first.[/dim]")
         return
 
-    combined = "\n\n".join(f"# File: {p}\n{c}" for p, c in files.items())
+    # Pass contents inline (not paths): the sandbox copies files into a FLAT temp
+    # dir, so any hardcoded path like "workspace/x.py" would not exist there.
+    base = _common_dir(files.keys())
+    sections = []
+    for p, c in files.items():
+        rel = os.path.relpath(p, base).replace("\\", "/")
+        sections.append(f"Filename: {rel}\nContent:\n```\n{c}\n```")
+    combined = "\n\n".join(sections)
+
     console.print("[dim]Generating tests…[/dim]")
     prompt = (
-        "Generate comprehensive, runnable test cases for the following code. "
+        "Generate comprehensive, runnable test cases for the code below. "
         "Use plain asserts or the unittest module so it runs with `python <file>` "
         "(no pytest). Cover edge cases. Reply with ONE code block only.\n\n"
+        "IMPORTANT RULES:\n"
+        "- Do NOT reference directory paths (no 'workspace/...', no __file__-relative dirs). "
+        "Test the logic directly by embedding code/expected values in the test file; "
+        "use tempfile if file I/O is genuinely needed.\n"
+        "- If you must import or read a source file, it sits NEXT TO the test file "
+        "under exactly the Filename shown below (e.g. 'app.py', 'templates/index.html').\n\n"
         f"{combined}"
     )
     response = agent.brain.think(
@@ -238,14 +259,18 @@ def cmd_change_api(console, agent):
 
 
 # ── /harness ─────────────────────────────────────────────────────────────────
-def cmd_harness(console, args):
+def cmd_harness(console, args, settings=None):
     action = args.strip().lower()
 
     if action == "on":
         harness.set_enabled(True)
+        if settings:
+            settings.set("harness_enabled", True)
         console.print("[red]Harness enabled.[/red]")
     elif action == "off":
         harness.set_enabled(False)
+        if settings:
+            settings.set("harness_enabled", False)
         console.print("[red]Harness disabled.[/red]")
     elif action == "show":
         run = harness.last_run()
@@ -269,9 +294,13 @@ def cmd_harness(console, args):
             console.print(f"[dim]Saved to: {saved[0]}[/dim]")
     elif action in ("summary on", "summary"):
         harness.summary = True
+        if settings:
+            settings.set("harness_summary", True)
         console.print("[red]Post-run harness summary enabled.[/red]")
     elif action == "summary off":
         harness.summary = False
+        if settings:
+            settings.set("harness_summary", False)
         console.print("[red]Post-run harness summary disabled.[/red]")
     else:
         console.print("[dim]Usage: /harness on | off | show | summary on|off[/dim]")
@@ -331,3 +360,212 @@ def print_harness_summary(console, run):
     console.print(table)
     for err in s["errors"][:3]:
         console.print(f"[red]⚠ {err}[/red]")
+
+
+# ── /server ──────────────────────────────────────────────────────────────────
+def _resolve_server_target(console, project_manager, name=None):
+    """Pick which project to serve. Returns (name, dir, type) or None.
+
+    Default order: explicit name → active project → the only web project in
+    workspace/ → root-level app.py/server.js as a 'workspace' pseudo-project.
+    """
+    if name:
+        d = project_manager.workspace_dir / name
+        if not d.is_dir():
+            console.print(f"[red]No project named '{name}' in workspace/.[/red]")
+            return None
+        return name, d, detect_project_type(d)
+
+    if project_manager.current_project:
+        return (project_manager.current_project,
+                project_manager.current_project_dir,
+                project_manager.current_project_type)
+
+    web = [p for p in project_manager.list_projects() if p["type"] in WEB_TYPES]
+    if len(web) == 1:
+        p = web[0]
+        return p["name"], Path(p["path"]), p["type"]
+
+    # Root-level flat app (older sessions wrote workspace/app.py directly).
+    root = project_manager.workspace_dir
+    root_app = root / "app.py"
+    if root_app.exists() and "Flask(" in root_app.read_text(encoding="utf-8", errors="replace"):
+        return "workspace", root, "flask"
+    if (root / "server.js").exists():
+        return "workspace", root, "express"
+
+    if web:
+        names = ", ".join(p["name"] for p in web)
+        console.print(f"[yellow]Multiple web projects found:[/yellow] {names}")
+        console.print("[dim]Usage: /server start <name>  (or /project use <name> first)[/dim]")
+    else:
+        console.print("[dim]No web project found in workspace/. Build one first.[/dim]")
+    return None
+
+
+def _prepare_run_dir(project_dir: Path, name: str, ptype: str, entry, port: int,
+                     root_only: bool = False) -> Path:
+    """Copy the project to a temp run dir and rewrite the entry's bind to <port>.
+
+    We never mutate the user's files — the port rewrite happens on the copy.
+    """
+    rundir = Path(tempfile.mkdtemp(prefix=f"darecode_srv_{name}_"))
+    if root_only:
+        for p in project_dir.iterdir():
+            if p.is_file():
+                shutil.copy2(p, rundir / p.name)
+    else:
+        shutil.copytree(
+            project_dir, rundir, dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("node_modules", "__pycache__", ".git"),
+        )
+    if entry and ptype != "static":
+        target = rundir / entry
+        if target.exists():
+            content = target.read_text(encoding="utf-8", errors="replace")
+            target.write_text(force_host_binding(content, port), encoding="utf-8")
+    return rundir
+
+
+def cmd_server(console, server_manager, project_manager, args):
+    parts = args.strip().split()
+    action = parts[0] if parts else "list"
+
+    if action == "start":
+        target = _resolve_server_target(
+            console, project_manager, parts[1] if len(parts) > 1 else None)
+        if not target:
+            return
+        name, pdir, ptype = target
+        if ptype not in WEB_TYPES:
+            console.print(f"[yellow]'{name}' looks like a {ptype} project — nothing to serve.[/yellow]")
+            return
+        entry = find_entry_file(pdir, ptype)
+        if ptype != "static" and not entry:
+            console.print(f"[red]No entry file found in {pdir}.[/red]")
+            return
+
+        port = server_manager.allocate_port(5000)
+        command = get_dev_command(ptype, entry, port)
+        rundir = _prepare_run_dir(pdir, name, ptype, entry, port,
+                                  root_only=(name == "workspace"))
+
+        console.print(f"[dim]Starting '{name}' ({ptype}) on port {port}…[/dim]")
+        result = server_manager.start(name=name, command=command, cwd=rundir, port=port)
+
+        # Grace period: catch instant crashes (import errors, syntax errors).
+        time.sleep(1.2)
+        if result["status"] == "running" and not server_manager.is_running(name):
+            tail = "\n".join(server_manager.get_output(name)) or "(no output captured)"
+            server_manager.stop(name)  # reap the dead entry
+            console.print(Panel(
+                f"[red]Server '{name}' crashed on startup:[/red]\n{tail}",
+                border_style="red", title="[bold red]Server Error[/bold red]"))
+            return
+
+        if result["status"] == "running":
+            url = result.get("url") or f"http://localhost:{port}"
+            opened = server_manager.open_in_browser(name)
+            hint = "" if opened else "\n[dim]Open the link above in your browser.[/dim]"
+            console.print(Panel(
+                f"[green]Server running.[/green]\n\n"
+                f"  [bold]Name:[/bold] {name}\n"
+                f"  [bold]URL:[/bold]  [bold cyan][link={url}]{url}[/link][/bold cyan]\n"
+                f"  [bold]PID:[/bold]  {result['pid']}\n"
+                f"{hint}\n[dim]/server stop to shut down · /server list to see all.[/dim]",
+                border_style="green", title="[bold green]🚀 Dev Server[/bold green]"))
+        else:
+            console.print(Panel(
+                f"[red]Failed to start '{name}':[/red]\n{result.get('error') or 'Unknown error'}",
+                border_style="red", title="[bold red]Server Error[/bold red]"))
+
+    elif action == "stop":
+        name = parts[1] if len(parts) > 1 else None
+        if not name:
+            running = server_manager.running_names()
+            if project_manager.current_project in running:
+                name = project_manager.current_project
+            elif len(running) == 1:
+                name = running[0]
+            elif not running:
+                console.print("[dim]No servers running.[/dim]")
+                return
+            else:
+                console.print(f"[yellow]Multiple servers running:[/yellow] {', '.join(running)}")
+                console.print("[dim]Usage: /server stop <name>[/dim]")
+                return
+        result = server_manager.stop(name)
+        if result["status"] == "stopped":
+            console.print(f"[green]✓ Server '{name}' stopped.[/green]")
+        elif result["status"] == "not_found":
+            console.print(f"[dim]No server named '{name}' is running.[/dim]")
+        else:
+            console.print(f"[red]Error stopping '{name}': {result.get('error')}[/red]")
+
+    elif action == "list":
+        servers = server_manager.list_servers()
+        if not servers:
+            console.print("[dim]No servers running.[/dim]")
+            return
+        table = Table(title="[bold red]Servers[/bold red]", border_style="red")
+        table.add_column("Name", style="bold red")
+        table.add_column("URL", style="bold white")
+        table.add_column("Port", justify="right")
+        table.add_column("PID", style="dim", justify="right")
+        table.add_column("Status", justify="center")
+        for s in servers:
+            color = "green" if s["status"] == "running" else "red"
+            table.add_row(s["name"], s.get("url") or "—", str(s.get("port") or "—"),
+                          str(s["pid"]), f"[{color}]{s['status']}[/{color}]")
+        console.print(table)
+
+    else:
+        console.print("[dim]Usage: /server start [name] | /server stop [name] | /server list[/dim]")
+
+
+# ── /project ─────────────────────────────────────────────────────────────────
+def cmd_project(console, agent, project_manager, args):
+    action = args.strip()
+
+    if not action or action == "list":
+        projects = project_manager.list_projects()
+        if not projects:
+            console.print("[dim]No projects in workspace/ yet. Ask me to build one![/dim]")
+            return
+        table = Table(title="[bold red]Projects[/bold red]", border_style="red")
+        table.add_column("Name", style="bold red")
+        table.add_column("Type", style="bold white")
+        table.add_column("Files", justify="right")
+        table.add_column("Path", style="dim")
+        current = project_manager.current_project
+        for p in projects:
+            name = f"► {p['name']}" if p["name"] == current else p["name"]
+            table.add_row(name, p["type"], str(p["file_count"]), p["path"])
+        console.print(table)
+
+    elif action.startswith("use "):
+        name = action[4:].strip()
+        if project_manager.set_current(name):
+            agent.current_project = name
+            agent.current_project_dir = str(project_manager.current_project_dir)
+            console.print(
+                f"[green]✓ Switched to project: {name} "
+                f"({project_manager.current_project_type})[/green]")
+        else:
+            console.print(f"[red]Project '{name}' not found in workspace/.[/red]")
+
+    else:
+        console.print("[dim]Usage: /project list | /project use <name>[/dim]")
+
+
+# ── /team ────────────────────────────────────────────────────────────────────
+def cmd_team(console, settings, args):
+    action = args.strip().lower()
+    if action in ("on", "off"):
+        settings.set("defenders_auto", action == "on")
+        state = "enabled — normal requests now assemble the Defenders" if action == "on" \
+                else "disabled — normal requests use the solo agent"
+        console.print(f"[red]Team auto-mode {state}.[/red]")
+    else:
+        current = "on" if settings.get("defenders_auto", False) else "off"
+        console.print(f"[dim]Usage: /team on | /team off   (currently: {current})[/dim]")

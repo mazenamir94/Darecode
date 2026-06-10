@@ -1,0 +1,201 @@
+import os
+import tempfile
+import subprocess
+from pathlib import Path
+import re
+import platform
+import shutil
+
+class Sandbox:
+    def __init__(self, workspace_dir: str = "workspace"):
+        self.workspace_dir = Path(workspace_dir)
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="darecode_"))
+
+    def _strip_browser_commands(self, content: str) -> str:
+        """Removes code trying to open browsers directly."""
+        import_pattern = r"(import\s+webbrowser)|(from\s+webbrowser\s+import\s+.*)"
+        call_pattern = r"(webbrowser\.open\([^)]*\))|(webbrowser\.open_new\([^)]*\))|(webbrowser\.open_new_tab\([^)]*\))"
+        content = re.sub(import_pattern, "", content)
+        content = re.sub(call_pattern, "pass  # Suppressed webbrowser call", content)
+        return content
+
+    def _force_host_binding(self, content: str) -> str:
+        """Make generated web servers bind 0.0.0.0:5000 so they're reachable from the host.
+
+        Safety net on top of the Spider-Man prompt instruction. Only rewrites when a
+        0.0.0.0 binding isn't already present, to avoid clobbering correct code.
+        """
+        if "0.0.0.0" in content:
+            return content
+
+        # Flask: app.run(...) → app.run(host="0.0.0.0", port=5000)
+        content = re.sub(
+            r"\.run\([^)]*\)",
+            '.run(host="0.0.0.0", port=5000)',
+            content,
+            count=1,
+        ) if re.search(r"\.run\(", content) and "Flask" in content else content
+
+        # Express: app.listen(5000[, ...]) → app.listen(5000, "0.0.0.0"[, ...])
+        content = re.sub(
+            r"\.listen\(\s*(\d+)",
+            r'.listen(\1, "0.0.0.0"',
+            content,
+            count=1,
+        )
+
+        return content
+
+    def write_files(self, files: dict) -> None:
+        """Writes ALL files to the workspace."""
+        for filepath, content in files.items():
+            path = self.workspace_dir / filepath
+            path.parent.mkdir(parents=True, exist_ok=True)
+            clean_content = self._force_host_binding(self._strip_browser_commands(content))
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(clean_content)
+                
+            temp_path = self.temp_dir / filepath
+            temp_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.write(clean_content)
+
+    def is_web_server(self, files: dict) -> bool:
+        """Detect if the code starts a local web server."""
+        for content in files.values():
+            if "app.run(" in content and "Flask" in content:
+                return True
+            if "uvicorn.run(" in content and "FastAPI" in content:
+                return True
+            if "http.server" in content or "SimpleHTTPServer" in content:
+                return True
+            if "express()" in content and ".listen(" in content:
+                return True
+        return False
+
+    def _open_browser(self, url: str):
+        """Platform-aware browser opening logic.
+
+        Inside a container there is no browser/display, so we skip silently and
+        rely on the URL printed by the /execute handler for manual open.
+        """
+        if os.path.exists("/.dockerenv"):
+            return
+        if platform.system() == "Windows":
+            subprocess.Popen(["cmd.exe", "/c", f"start {url}"], shell=False)
+        else:
+            if shutil.which("wslview"):
+                subprocess.Popen(["wslview", url])
+            elif shutil.which("xdg-open"):
+                subprocess.Popen(["xdg-open", url])
+
+    def execute(self, files: dict, entrypoint: str = "main.py", timeout: int = 30) -> dict:
+        """Executes code via Docker sandbox, falling back to local Python if missing."""
+        self.write_files(files)
+        
+        # Resolve the entrypoint
+        abs_entrypoint = self.temp_dir / entrypoint
+        if not abs_entrypoint.exists():
+            return {"exit_code": 1, "stdout": "", "stderr": f"Entrypoint {entrypoint} not found."}
+            
+        ext = abs_entrypoint.suffix
+        if ext == ".py":
+            cmd = ["python", str(abs_entrypoint.name)]
+            image = "python:3.10-slim"
+        elif ext == ".js":
+            cmd = ["node", str(abs_entrypoint.name)]
+            image = "node:18-slim"
+        elif ext == ".sh":
+            cmd = ["bash", str(abs_entrypoint.name)]
+            image = "ubuntu:22.04"
+        else:
+            cmd = [str(abs_entrypoint.name)]
+            image = "ubuntu:22.04"
+
+        try:
+            # Check for Docker
+            subprocess.run(["docker", "--version"], check=True, capture_output=True)
+            
+            docker_cmd = [
+                "docker", "run", "--rm",
+                "-v", f"{self.temp_dir.absolute()}:/app",
+                "-w", "/app",
+                "--network", "host" if self.is_web_server(files) else "none",
+                image
+            ] + cmd
+
+            if self.is_web_server(files):
+                # Web server logic
+                process = subprocess.Popen(
+                    docker_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8"
+                )
+                import time
+                time.sleep(2)  # Wait for server to bind
+                if process.poll() is None:
+                    # Still running, assume success
+                    self._open_browser("http://localhost:5000")
+                    return {"exit_code": 0, "stdout": "Web server running.", "stderr": ""}
+                
+                # Server crashed
+                out, err = process.communicate()
+                return {"exit_code": process.returncode, "stdout": out, "stderr": err}
+            else:
+                # Normal script execution
+                result = subprocess.run(
+                    docker_cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=timeout
+                )
+                return {
+                    "exit_code": result.returncode,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr
+                }
+
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # Docker not available or failed, fallback to local execution
+            if self.is_web_server(files):
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=str(self.temp_dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8"
+                )
+                import time
+                time.sleep(2)
+                if process.poll() is None:
+                    self._open_browser("http://localhost:5000")
+                    return {"exit_code": 0, "stdout": "Web server running locally.", "stderr": ""}
+                out, err = process.communicate()
+                return {"exit_code": process.returncode, "stdout": out, "stderr": err}
+            else:
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        cwd=str(self.temp_dir),
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        timeout=timeout
+                    )
+                    return {
+                        "exit_code": result.returncode,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr
+                    }
+                except subprocess.TimeoutExpired:
+                    return {"exit_code": 1, "stdout": "", "stderr": f"Execution timed out after {timeout} seconds"}
+
+    def cleanup(self):
+        """Removes the temporary directory."""
+        if self.temp_dir.exists():
+            shutil.rmtree(self.temp_dir, ignore_errors=True)

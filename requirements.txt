@@ -1,0 +1,8 @@
+requests
+requests-aws4auth
+python-dotenv
+rich
+prompt_toolkit
+flask
+fastapi
+uvicorn

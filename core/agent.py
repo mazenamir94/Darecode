@@ -136,9 +136,18 @@ PROJECT STRUCTURE RULES:
 
                     with harness.span("tool", name, args=self._arg_summary(args)) as tool_span:
                         tool_result = run_tool(name, **args)
-                        is_error = bool(tool_result.get("error")) or tool_result.get("success") is False
+                        # A tool "failed" if it errored, reported success=False, or
+                        # (for bash) exited non-zero — including a denied command.
+                        is_error = (
+                            bool(tool_result.get("error"))
+                            or tool_result.get("success") is False
+                            or tool_result.get("exit_code") not in (None, 0)
+                        )
                         if is_error:
-                            tool_span.set(error=tool_result.get("error") or "tool reported failure")
+                            reason = (tool_result.get("error")
+                                      or tool_result.get("stderr")
+                                      or "tool reported failure")
+                            tool_span.set(error=reason)
                             tool_span.mark_error()
 
                     self.metrics["tool_calls"] += 1

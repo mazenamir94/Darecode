@@ -370,11 +370,14 @@ def _resolve_server_target(console, project_manager, name=None):
     workspace/ → root-level app.py/server.js as a 'workspace' pseudo-project.
     """
     if name:
-        d = project_manager.workspace_dir / name
-        if not d.is_dir():
+        # Use set_current for fuzzy matching (hyphen/underscore/case-insensitive)
+        # then read back the resolved name so the server is keyed correctly.
+        if not project_manager.set_current(name):
             console.print(f"[red]No project named '{name}' in workspace/.[/red]")
             return None
-        return name, d, detect_project_type(d)
+        return (project_manager.current_project,
+                project_manager.current_project_dir,
+                project_manager.current_project_type)
 
     if project_manager.current_project:
         return (project_manager.current_project,

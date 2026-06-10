@@ -159,11 +159,33 @@ class ProjectManager:
         return self._current_project_type
 
     # ── Activation ─────────────────────────────────────────────────────
+    def _resolve_name(self, name: str) -> Optional[str]:
+        """Return the actual workspace subdir name that matches `name`.
+
+        Tries in order: exact → case-insensitive → hyphen/underscore swap.
+        This lets `/project use project-a` match a dir named `project_a` (or vice versa).
+        """
+        if not self.workspace_dir.exists():
+            return None
+        norm = name.lower()
+        swap = name.replace("-", "_") if "-" in name else name.replace("_", "-")
+        for d in self.workspace_dir.iterdir():
+            if not d.is_dir() or d.name in _IGNORED_DIRS:
+                continue
+            if d.name == name:
+                return d.name
+            if d.name.lower() == norm:
+                return d.name
+            if d.name == swap:
+                return d.name
+        return None
+
     def set_current(self, name: str) -> bool:
-        project_dir = self.workspace_dir / name
-        if project_dir.exists() and project_dir.is_dir():
-            self._current_project = name
-            self._current_project_dir = project_dir
-            self._current_project_type = detect_project_type(project_dir)
-            return True
-        return False
+        resolved = self._resolve_name(name)
+        if resolved is None:
+            return False
+        project_dir = self.workspace_dir / resolved
+        self._current_project = resolved
+        self._current_project_dir = project_dir
+        self._current_project_type = detect_project_type(project_dir)
+        return True

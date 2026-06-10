@@ -76,9 +76,24 @@ class Sandbox:
             with open(temp_path, "w", encoding="utf-8") as f:
                 f.write(clean_content)
 
-    def is_web_server(self, files: dict) -> bool:
-        """Detect if the code starts a local web server."""
-        for content in files.values():
+    def is_web_server(self, files: dict, entrypoint: str = None) -> bool:
+        """Detect if the code starts a local web server.
+        
+        If entrypoint is provided, only checks files in the same project
+        directory as the entrypoint (not the entire workspace).
+        """
+        if entrypoint:
+            project_dir = str(Path(entrypoint).parent)
+            if project_dir == ".":
+                # Entrypoint is at workspace root — only check root-level files
+                check_files = {k: v for k, v in files.items() if "/" not in k and "\\" not in k}
+            else:
+                # Only check files in the same project directory
+                check_files = {k: v for k, v in files.items() if k.startswith(project_dir + "/")}
+        else:
+            check_files = files
+
+        for content in check_files.values():
             if "app.run(" in content and "Flask" in content:
                 return True
             if "uvicorn.run(" in content and "FastAPI" in content:
@@ -105,27 +120,32 @@ class Sandbox:
             elif shutil.which("xdg-open"):
                 subprocess.Popen(["xdg-open", url])
 
-    def execute(self, files: dict, entrypoint: str = "main.py", timeout: int = 30) -> dict:
-        """Executes code via Docker sandbox, falling back to local Python if missing."""
+    def execute(self, files: dict, entrypoint: str = "main.py", timeout: int = 30, stdin_data: str = None) -> dict:
+        """Executes code via Docker sandbox, falling back to local Python if missing.
+        
+        Args:
+            stdin_data: Optional string to pipe as stdin to the process.
+                        If None, stdin is closed (DEVNULL) to prevent hangs on input().
+        """
         self.write_files(files)
         
         # Resolve the entrypoint
         abs_entrypoint = self.temp_dir / entrypoint
-        if not abs_entrypoint.exists():
-            return {"exit_code": 1, "stdout": "", "stderr": f"Entrypoint {entrypoint} not found."}
+        if not abs_entrypoint.exists() or not abs_entrypoint.is_file():
+            return {"exit_code": 1, "stdout": "", "stderr": f"Entrypoint '{entrypoint}' is not a valid file."}
             
         ext = abs_entrypoint.suffix
         if ext == ".py":
-            cmd = ["python", str(abs_entrypoint.name)]
+            cmd = ["python", entrypoint]
             image = "python:3.10-slim"
         elif ext == ".js":
-            cmd = ["node", str(abs_entrypoint.name)]
+            cmd = ["node", entrypoint]
             image = "node:18-slim"
         elif ext == ".sh":
-            cmd = ["bash", str(abs_entrypoint.name)]
+            cmd = ["bash", entrypoint]
             image = "ubuntu:22.04"
         else:
-            cmd = [str(abs_entrypoint.name)]
+            cmd = [entrypoint]
             image = "ubuntu:22.04"
 
         try:
@@ -136,11 +156,11 @@ class Sandbox:
                 "docker", "run", "--rm",
                 "-v", f"{self.temp_dir.absolute()}:/app",
                 "-w", "/app",
-                "--network", "host" if self.is_web_server(files) else "none",
+                "--network", "host" if self.is_web_server(files, entrypoint) else "none",
                 image
             ] + cmd
 
-            if self.is_web_server(files):
+            if self.is_web_server(files, entrypoint):
                 # Web server logic
                 process = subprocess.Popen(
                     docker_cmd,
@@ -166,7 +186,9 @@ class Sandbox:
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
-                    timeout=timeout
+                    timeout=timeout,
+                    input=stdin_data,
+                    stdin=subprocess.DEVNULL if stdin_data is None else None
                 )
                 return {
                     "exit_code": result.returncode,
@@ -176,7 +198,7 @@ class Sandbox:
 
         except (subprocess.CalledProcessError, FileNotFoundError):
             # Docker not available or failed, fallback to local execution
-            if self.is_web_server(files):
+            if self.is_web_server(files, entrypoint):
                 process = subprocess.Popen(
                     cmd,
                     cwd=str(self.temp_dir),
@@ -200,7 +222,9 @@ class Sandbox:
                         capture_output=True,
                         text=True,
                         encoding="utf-8",
-                        timeout=timeout
+                        timeout=timeout,
+                        input=stdin_data,
+                        stdin=subprocess.DEVNULL if stdin_data is None else None
                     )
                     return {
                         "exit_code": result.returncode,

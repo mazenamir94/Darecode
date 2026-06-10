@@ -433,10 +433,16 @@ Available defenders:
 
         if user_input.startswith("/execute"):
             from core.sandbox import Sandbox
-            from pathlib import Path
-            import os
             
             prompt = user_input[len("/execute"):].strip()
+            
+            # Extract stdin data if provided (e.g., "/execute fibonacci <<< 10")
+            stdin_data = None
+            if "<<<" in prompt:
+                parts = prompt.split("<<<", 1)
+                prompt = parts[0].strip()
+                stdin_data = parts[1].strip() + "\n"
+            
             workspace_dir = Path("workspace")
             files = {}
             if workspace_dir.exists() and workspace_dir.is_dir():
@@ -466,12 +472,41 @@ Available defenders:
                 else:
                     entrypoint = list(files.keys())[0]
                     console.print(f"[dim]No entrypoint specified. Auto-selected: {entrypoint}[/dim]")
-            
+
+            # If entrypoint is a bare filename, resolve it to its subdir path.
+            if entrypoint and entrypoint not in files:
+                # First, try matching by filename (e.g., "fibonacci.py" -> "fibonacci/fibonacci.py")
+                candidates = [k for k in files if Path(k).name == entrypoint]
+                
+                # If no match, check if it's a project/directory name and find a main file inside it
+                if not candidates:
+                    dir_prefix = entrypoint.rstrip("/") + "/"
+                    dir_files = [k for k in files if k.startswith(dir_prefix)]
+                    if dir_files:
+                        # Look for common entrypoints inside the directory
+                        for default_name in ["main.py", "app.py", "index.js", "index.py"]:
+                            match = dir_prefix + default_name
+                            if match in dir_files:
+                                candidates = [match]
+                                break
+                        # If no common entrypoint, pick the first .py or .js file in the directory
+                        if not candidates:
+                            code_files = [f for f in dir_files if f.endswith((".py", ".js", ".sh"))]
+                            if code_files:
+                                candidates = [code_files[0]]
+                
+                if candidates:
+                    active = agent.current_project
+                    preferred = [c for c in candidates if active and c.startswith(active + "/")]
+                    resolved = (preferred or candidates)[0]
+                    console.print(f"[dim]Resolved '{entrypoint}' → {resolved}[/dim]")
+                    entrypoint = resolved
+
             console.print("[dim]Executing in Sandbox...[/dim]")
             sandbox = Sandbox()
-            result = sandbox.execute(files, entrypoint)
+            result = sandbox.execute(files, entrypoint, stdin_data=stdin_data)
             
-            if sandbox.is_web_server(files):
+            if sandbox.is_web_server(files, entrypoint):
                 if result.get("exit_code", 1) == 0:
                     console.print(Panel(
                         "[bold green]Web server running.[/bold green]\n"
@@ -503,6 +538,17 @@ Available defenders:
 
         if user_input.startswith("/diff"):
             user_input = "Compare files: " + user_input[len("/diff"):].strip()
+
+        # Warn when a slash command is buried mid-sentence instead of leading.
+        _buried_cmd = re.search(
+            r'\B(/(?:server|project|stats|harness|team|model|clear|test|snippet|change|history))\b',
+            user_input,
+        )
+        if _buried_cmd:
+            console.print(
+                f"[dim]💡 Tip: slash commands must start the line. "
+                f"Try [bold]{_buried_cmd.group(1)}[/bold] on its own.[/dim]"
+            )
 
         print_spider("THINKING", current_color)
         display.start()

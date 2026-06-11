@@ -12,6 +12,7 @@ venv/
 harnesses/
 snippets/
 sessions/
+.darecode/
 
 # Agent scratch/output area — not part of the app source
 workspace/

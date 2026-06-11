@@ -77,6 +77,16 @@ class TestSettings(unittest.TestCase):
         s3 = Settings(self.dir)
         self.assertIsNone(s3.get("sneaky_api_key"))
 
+    def test_default_config_dir_is_project_local_in_container(self):
+        # Inside Docker (/.dockerenv exists), config must live in the bind-mounted
+        # repo (./.darecode) — ~/.darecode dies with `docker compose run --rm`.
+        from unittest.mock import patch
+        from core.settings import _default_config_dir
+        with patch("core.settings.os.path.exists", return_value=True):
+            self.assertEqual(_default_config_dir(), Path(".darecode"))
+        with patch("core.settings.os.path.exists", return_value=False):
+            self.assertEqual(_default_config_dir(), Path.home() / ".darecode")
+
     @unittest.skipIf(os.name == "nt", "chmod not meaningful on Windows")
     def test_chmod_600_after_save(self):
         s = Settings(self.dir)

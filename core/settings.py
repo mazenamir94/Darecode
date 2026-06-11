@@ -7,6 +7,7 @@ key that looks like a credential, even if asked to. Settings changed at runtime
 """
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -23,9 +24,19 @@ DEFAULTS = {
 _SECRET_KEY_RE = re.compile(r"(api[_-]?key|secret|token|password|bearer)", re.IGNORECASE)
 
 
+def _default_config_dir() -> Path:
+    # Inside a container, $HOME dies with the container (docker compose run --rm),
+    # so ~/.darecode would lose settings on every restart. The app's cwd (/app) is
+    # the bind-mounted repo — a project-local .darecode/ survives there. On the
+    # host, keep the conventional ~/.darecode.
+    if os.path.exists("/.dockerenv"):
+        return Path(".darecode")
+    return Path.home() / ".darecode"
+
+
 class Settings:
     def __init__(self, config_dir: Optional[Path] = None):
-        self.config_dir = Path(config_dir) if config_dir else Path.home() / ".darecode"
+        self.config_dir = Path(config_dir) if config_dir else _default_config_dir()
         self.config_file = self.config_dir / "config.json"
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self._data = dict(DEFAULTS)

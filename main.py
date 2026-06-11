@@ -19,7 +19,7 @@ from core import harnesses
 from core.harnesses import harness
 from core.settings import Settings, apply_settings
 from core.server_manager import ServerManager
-from core.project_manager import ProjectManager
+from core.project_manager import ProjectManager, find_entry_file
 from pathlib import Path
 
 def print_response(console, text, color="red"):
@@ -443,22 +443,47 @@ Available defenders:
                 prompt = parts[0].strip()
                 stdin_data = parts[1].strip() + "\n"
             
-            workspace_dir = Path("workspace")
             files = {}
-            if workspace_dir.exists() and workspace_dir.is_dir():
-                for p in workspace_dir.rglob("*"):
-                    if p.is_file():
-                        try:
-                            files[str(p.relative_to(workspace_dir))] = p.read_text(encoding="utf-8")
-                        except Exception:
-                            pass
-            
+            entrypoint = ""
+
+            # Bare /execute + active project → run that project by default.
+            if not prompt and project_manager.current_project_dir:
+                pdir = project_manager.current_project_dir
+                entry = find_entry_file(pdir, project_manager.current_project_type)
+                if entry:
+                    for p in pdir.rglob("*"):
+                        if p.is_file():
+                            try:
+                                files[str(p.relative_to(pdir)).replace("\\", "/")] = \
+                                    p.read_text(encoding="utf-8")
+                            except Exception:
+                                pass
+                    entrypoint = entry
+                    console.print(
+                        f"[dim]Executing active project: "
+                        f"{project_manager.current_project} ({entry})[/dim]")
+                else:
+                    console.print(
+                        f"[dim]Active project '{project_manager.current_project}' has no "
+                        f"recognizable entry file — falling back to workspace scan.[/dim]")
+
+            if not files:
+                workspace_dir = Path("workspace")
+                if workspace_dir.exists() and workspace_dir.is_dir():
+                    for p in workspace_dir.rglob("*"):
+                        if p.is_file():
+                            try:
+                                files[str(p.relative_to(workspace_dir))] = p.read_text(encoding="utf-8")
+                            except Exception:
+                                pass
+
             if not files:
                 console.print("[yellow]No files found in workspace/ to execute.[/yellow]")
                 continue
-                
+
             # Extract just the first token as entrypoint, ignoring extra conversational text
-            entrypoint = prompt.split()[0] if prompt else ""
+            if not entrypoint:
+                entrypoint = prompt.split()[0] if prompt else ""
             
             # If user explicitly typed workspace/file.py, strip the workspace/ part
             if entrypoint.startswith("workspace/") or entrypoint.startswith("workspace\\"):

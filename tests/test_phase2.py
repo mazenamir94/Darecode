@@ -149,6 +149,20 @@ class TestServerManager(unittest.TestCase):
     def test_stop_nonexistent(self):
         self.assertEqual(self.sm.stop("nonexistent")["status"], "not_found")
 
+    def test_reap_dead_removes_exited_server(self):
+        quick = f'"{sys.executable}" -c "pass"'  # exits immediately
+        self.sm.start("ghost", quick, cwd=self.cwd, port=find_free_port(5000))
+        proc = self.sm._servers["ghost"].process
+        self.assertTrue(_wait_dead(proc), "quick process never exited")
+        reaped = self.sm.reap_dead()
+        self.assertIn("ghost", reaped)
+        self.assertEqual(self.sm.list_servers(), [])
+
+    def test_reap_dead_keeps_running_server(self):
+        self.sm.start("alive", SLEEPER, cwd=self.cwd, port=find_free_port(5000))
+        self.assertEqual(self.sm.reap_dead(), [])
+        self.assertTrue(self.sm.is_running("alive"))
+
 
 # ── core/project_manager.py ──────────────────────────────────────────────────
 class TestProjectManager(unittest.TestCase):

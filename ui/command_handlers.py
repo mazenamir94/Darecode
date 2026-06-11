@@ -506,6 +506,10 @@ def cmd_server(console, server_manager, project_manager, args):
             console.print(f"[red]Error stopping '{name}': {result.get('error')}[/red]")
 
     elif action == "list":
+        reaped = server_manager.reap_dead()
+        if reaped:
+            console.print(f"[dim]Reaped dead server(s): {', '.join(reaped)} "
+                          f"(crashed or exited).[/dim]")
         servers = server_manager.list_servers()
         if not servers:
             console.print("[dim]No servers running.[/dim]")
@@ -515,11 +519,13 @@ def cmd_server(console, server_manager, project_manager, args):
         table.add_column("URL", style="bold white")
         table.add_column("Port", justify="right")
         table.add_column("PID", style="dim", justify="right")
+        table.add_column("Dir", style="dim")
         table.add_column("Status", justify="center")
         for s in servers:
             color = "green" if s["status"] == "running" else "red"
             table.add_row(s["name"], s.get("url") or "—", str(s.get("port") or "—"),
-                          str(s["pid"]), f"[{color}]{s['status']}[/{color}]")
+                          str(s["pid"]), Path(s["cwd"]).name,
+                          f"[{color}]{s['status']}[/{color}]")
         console.print(table)
 
     else:

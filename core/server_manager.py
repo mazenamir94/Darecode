@@ -261,6 +261,15 @@ class ServerManager:
         except Exception as e:
             return {"name": name, "status": "error", "error": str(e)}
 
+    def reap_dead(self) -> List[str]:
+        """Remove tracked servers whose process has exited (crashed or killed
+        externally). Returns the reaped names so the UI can mention them once."""
+        with self._lock:
+            dead = [n for n, s in self._servers.items() if s.process.poll() is not None]
+            for n in dead:
+                self._servers.pop(n, None)
+        return dead
+
     def stop_all(self):
         """Stop all running servers. Registered at exit."""
         with self._lock:
